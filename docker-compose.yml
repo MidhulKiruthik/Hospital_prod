@@ -1,11 +1,27 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: hospital_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hospital_ops}
+      POSTGRES_USER: ${POSTGRES_USER:-hospital_ops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hospital_ops} -d ${POSTGRES_DB:-hospital_ops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
 
   redis:
     image: redis:6-alpine
     container_name: hospital_redis
-    ports:
-      - "6379:6379"
     restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -17,51 +33,91 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: hospital_api
-    ports:
-      - "5000:5000"
+    restart: unless-stopped
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY:-hospital-ops-secret-2026}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-jwt-hospital-secret-2026}
-      - DATA_ENCRYPTION_KEY=${DATA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
-      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-rzp_test_SXY57KDTSDiRGZ}
-      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET:-wh6TKP4Pe1Qi5Yj5mOKHx3ZD}
-      - RAZORPAY_SIGNATURE_REQUIRED=${RAZORPAY_SIGNATURE_REQUIRED:-True}
-      - DATABASE_URL=sqlite:////data/hospital.db
-      - DEBUG=False
-      - AUTH_RATE_LIMIT=5 per minute
-      - DEFAULT_RATE_LIMIT=300 per hour
-      - ENABLE_PROMETHEUS_METRICS=True
-      - BACKUP_DIR=/data/backups
-      - BACKUP_RETENTION_HOURS=48
+      APP_ENV: ${APP_ENV:-development}
+      REDIS_URL: redis://redis:6379/0
+      RATE_LIMIT_STORAGE_URI: ${RATE_LIMIT_STORAGE_URI:-redis://redis:6379/0}
+      SECRET_KEY: ${SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET}
+      RAZORPAY_SIGNATURE_REQUIRED: ${RAZORPAY_SIGNATURE_REQUIRED:-True}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-hospital_ops}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hospital_ops}}
+      DEBUG: ${DEBUG:-False}
+      AUTO_RUN_MIGRATIONS: ${AUTO_RUN_MIGRATIONS:-True}
+      AUTO_CREATE_SCHEMA: ${AUTO_CREATE_SCHEMA:-False}
+      AUTH_RATE_LIMIT: ${AUTH_RATE_LIMIT:-5 per minute}
+      DEFAULT_RATE_LIMIT: ${DEFAULT_RATE_LIMIT:-300 per hour}
+      ENABLE_PROMETHEUS_METRICS: ${ENABLE_PROMETHEUS_METRICS:-True}
+      ENFORCE_HTTPS: ${ENFORCE_HTTPS:-False}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,https://localhost:8443}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-True}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@hospital.local}
+      ALLOW_PRIVILEGED_SELF_REGISTRATION: ${ALLOW_PRIVILEGED_SELF_REGISTRATION:-False}
+      REFRESH_TOKEN_EXPIRATION_DAYS: ${REFRESH_TOKEN_EXPIRATION_DAYS:-7}
+      SECURITY_EVENT_EXPORT_ENABLED: ${SECURITY_EVENT_EXPORT_ENABLED:-False}
+      SECURITY_EVENT_WEBHOOK_URL: ${SECURITY_EVENT_WEBHOOK_URL:-}
+      SECURITY_EVENT_WEBHOOK_TIMEOUT_SECONDS: ${SECURITY_EVENT_WEBHOOK_TIMEOUT_SECONDS:-3}
+      SECURITY_EVENT_WEBHOOK_TOKEN: ${SECURITY_EVENT_WEBHOOK_TOKEN:-}
+      FORECAST_MODEL: ${FORECAST_MODEL:-baseline}
+      ENABLE_TRANSFORMER_SUMMARIZATION: ${ENABLE_TRANSFORMER_SUMMARIZATION:-False}
+      TRANSFORMER_MODEL_NAME: ${TRANSFORMER_MODEL_NAME:-sshleifer/distilbart-cnn-12-6}
+      BACKUP_DIR: /data/backups
+      BACKUP_RETENTION_HOURS: ${BACKUP_RETENTION_HOURS:-48}
+      BACKUP_INTERVAL_MINUTES: ${BACKUP_INTERVAL_MINUTES:-15}
+      BACKUP_HEALTH_MAX_AGE_MINUTES: ${BACKUP_HEALTH_MAX_AGE_MINUTES:-30}
+      BACKUP_HEALTH_CHECK_ENABLED: ${BACKUP_HEALTH_CHECK_ENABLED:-False}
     volumes:
-      - db_data:/data
+      - backend_data:/data
       - ./backend:/app
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
     command: python app.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   celery_worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: hospital_celery_worker
+    restart: unless-stopped
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY:-hospital-ops-secret-2026}
-      - DATABASE_URL=sqlite:////data/hospital.db
-      - DATA_ENCRYPTION_KEY=${DATA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
-      - BACKUP_DIR=/data/backups
-      - BACKUP_RETENTION_HOURS=48
+      APP_ENV: ${APP_ENV:-development}
+      REDIS_URL: redis://redis:6379/0
+      RATE_LIMIT_STORAGE_URI: ${RATE_LIMIT_STORAGE_URI:-redis://redis:6379/0}
+      SECRET_KEY: ${SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-hospital_ops}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hospital_ops}}
+      AUTO_RUN_MIGRATIONS: ${AUTO_RUN_MIGRATIONS_WORKER:-False}
+      AUTO_CREATE_SCHEMA: ${AUTO_CREATE_SCHEMA_WORKER:-False}
+      FORECAST_MODEL: ${FORECAST_MODEL:-baseline}
+      ENABLE_TRANSFORMER_SUMMARIZATION: ${ENABLE_TRANSFORMER_SUMMARIZATION:-False}
+      TRANSFORMER_MODEL_NAME: ${TRANSFORMER_MODEL_NAME:-sshleifer/distilbart-cnn-12-6}
+      BACKUP_DIR: /data/backups
+      BACKUP_RETENTION_HOURS: ${BACKUP_RETENTION_HOURS:-48}
+      BACKUP_INTERVAL_MINUTES: ${BACKUP_INTERVAL_MINUTES:-15}
     volumes:
-      - db_data:/data
+      - backend_data:/data
       - ./backend:/app
     depends_on:
-      - redis
-      - api
-    restart: unless-stopped
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
     command: celery -A celery_worker.celery worker --loglevel=info --concurrency=4
 
   celery_beat:
@@ -69,20 +125,33 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: hospital_celery_beat
+    restart: unless-stopped
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - SECRET_KEY=${SECRET_KEY:-hospital-ops-secret-2026}
-      - DATABASE_URL=sqlite:////data/hospital.db
-      - DATA_ENCRYPTION_KEY=${DATA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
-      - BACKUP_DIR=/data/backups
-      - BACKUP_RETENTION_HOURS=48
+      APP_ENV: ${APP_ENV:-development}
+      REDIS_URL: redis://redis:6379/0
+      RATE_LIMIT_STORAGE_URI: ${RATE_LIMIT_STORAGE_URI:-redis://redis:6379/0}
+      SECRET_KEY: ${SECRET_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-hospital_ops}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-hospital_ops}}
+      AUTO_RUN_MIGRATIONS: ${AUTO_RUN_MIGRATIONS_BEAT:-False}
+      AUTO_CREATE_SCHEMA: ${AUTO_CREATE_SCHEMA_BEAT:-False}
+      FORECAST_MODEL: ${FORECAST_MODEL:-baseline}
+      ENABLE_TRANSFORMER_SUMMARIZATION: ${ENABLE_TRANSFORMER_SUMMARIZATION:-False}
+      TRANSFORMER_MODEL_NAME: ${TRANSFORMER_MODEL_NAME:-sshleifer/distilbart-cnn-12-6}
+      BACKUP_DIR: /data/backups
+      BACKUP_RETENTION_HOURS: ${BACKUP_RETENTION_HOURS:-48}
+      BACKUP_INTERVAL_MINUTES: ${BACKUP_INTERVAL_MINUTES:-15}
     volumes:
-      - db_data:/data
+      - backend_data:/data
       - ./backend:/app
     depends_on:
-      - redis
-      - celery_worker
-    restart: unless-stopped
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      celery_worker:
+        condition: service_started
     command: celery -A celery_worker.celery beat --loglevel=info
 
   frontend:
@@ -90,14 +159,63 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: hospital_frontend
+    restart: unless-stopped
+    environment:
+      ALLOW_SELF_SIGNED_TLS: ${ALLOW_SELF_SIGNED_TLS:-False}
     ports:
       - "8080:80"
       - "8443:443"
     volumes:
       - ./frontend:/usr/share/nginx/html
+      - ./certs:/etc/nginx/certs:ro
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: hospital_prometheus
     restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: hospital_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS_ENABLED:-False}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/hospital-overview.json
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      prometheus:
+        condition: service_started
+    ports:
+      - "127.0.0.1:3000:3000"
 
 volumes:
-  db_data:
+  postgres_data:
+  backend_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:

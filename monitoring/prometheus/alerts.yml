@@ -1,0 +1,38 @@
+groups:
+  - name: hospital-ops
+    rules:
+      - alert: HospitalApiDown
+        expr: hospital_db_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Hospital API database check failing
+          description: Database connectivity is down for more than 2 minutes.
+
+      - alert: HospitalRedisDown
+        expr: hospital_redis_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Redis connectivity failing
+          description: Redis connectivity check is failing for more than 2 minutes.
+
+      - alert: HospitalBackupStale
+        expr: hospital_backup_latest_age_minutes > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Backup appears stale
+          description: Latest backup age exceeds configured threshold.
+
+      - alert: HospitalWorkerStale
+        expr: hospital_worker_heartbeat_age_seconds > 120
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Worker heartbeat stale
+          description: No recent workload snapshot from background workers.

@@ -1,0 +1,6 @@
+statsmodels==0.14.3
+lightgbm==4.4.0
+transformers==4.44.0
+tokenizers==0.19.1
+scikit-learn==1.5.1
+# Install torch separately for your platform if you enable transformer summarization.

@@ -1,213 +1,217 @@
 # Cloud-Native Intelligent Hospital Operations Platform
-**BCSE408L — Cloud Computing | DA1 Project**
 
-> Group: Midhul Kiruthik M · Madhan Karthikeyan · Sachin VP · Sharvesh
+Prototype hospital operations system with workload-aware appointment assignment, short-horizon forecasting, asynchronous clinical summary generation, observability, and backup tooling.
 
----
+## What Is Implemented
 
-## Architecture Overview
+- Smart appointment load balancing with workload scoring and reassignment
+- JWT auth with RBAC and audit logging
+- Redis + Celery background processing
+- Short-horizon workload forecasting with a baseline model and optional advanced model paths
+- Rule-based clinical NLP with optional transformer-backed summarization path
+- Prometheus metrics and Grafana provisioning
+- Periodic backups with checksum output (SQLite and PostgreSQL paths)
+- Docker Compose deployment for EC2 or local environments
 
-```
-VueJS Frontend ──HTTPS REST──► Flask API (Stateless)
-                                    │
-                              ┌─────┴──────┐
-                              │  JWT RBAC  │
-                              └─────┬──────┘
-                    ┌───────────────┼─────────────────┐
-                    ▼               ▼                  ▼
-               Redis Cache   Redis Broker        SQLite DB
-               (workload     (task queue)        (persistent)
-               forecasts)         │
-                              Celery Workers
-                              ├── NLP Summary Generator
-                              ├── Workload Snapshot (30s)
-                              ├── Forecast Updater (60s)
-                              └── Backup Snapshot (every 15 min)
-```
+## Stack
 
----
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Frontend | Vue.js 3 · Chart.js 4 |
-| Backend API | Flask 3 · Python 3.11 |
-| Task Queue | Celery 5.x |
-| Cache / Broker | Redis 6.x |
-| Database | SQLite (prototype) / PostgreSQL (prod) |
-| NLP | Rule-based + optional DistilBERT/T5 |
-| Monitoring | Prometheus + Grafana (via metrics endpoint) |
-| Auth | JWT + RBAC |
-| API Protection | Flask-Limiter rate limits |
-| Data Protection | Encrypted clinical summaries at rest |
-
----
+- Frontend: Vue.js + Nginx
+- Backend: Flask + SQLAlchemy
+- Queue / broker: Celery + Redis
+- Monitoring: Prometheus + Grafana
+- Database: PostgreSQL (containerized) with Alembic migrations
+- Optional advanced modeling: statsmodels, LightGBM, transformers
 
 ## Quick Start
 
-### Option 1: Docker Compose (Recommended)
+1. Copy environment settings:
 
 ```bash
-git clone <repo>
-cd hospital-ops
-docker-compose up --build
+cp .env.example .env
 ```
 
-- Frontend:  http://localhost:8080
-- Frontend (TLS): https://localhost:8443
-- API:       http://localhost:5000
-- API Docs:  http://localhost:5000/api/health
-- Prometheus metrics: http://localhost:5000/metrics
+2. Edit `.env` and replace all placeholder secrets.
 
-### Option 2: Local Development
+3. Put real TLS certificate files in `certs/`:
 
-**Prerequisites:** Python 3.11+, Redis running on localhost:6379
+- `certs/fullchain.pem`
+- `certs/privkey.pem`
+
+If you are running a local dev demo without real certs, set `ALLOW_SELF_SIGNED_TLS=True`.
+
+4. Start the stack:
 
 ```bash
-cd backend
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate       # Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Copy env config
-cp ../.env.example .env
-
-# Run Flask API
-python app.py
-
-# In another terminal: Run Celery Worker
-celery -A celery_worker.celery worker --loglevel=info
-
-# In another terminal: Run Celery Beat (periodic tasks)
-celery -A celery_worker.celery beat --loglevel=info
+docker compose up --build -d
 ```
 
-Open `frontend/index.html` in your browser (or serve with any static server).
+5. Open:
 
----
+- Frontend: `http://localhost:8080`
+- Frontend TLS: `https://localhost:8443`
+- API health: `http://localhost:8080/api/health`
+- Deep health: `http://localhost:8080/api/health/deep`
 
-## Demo Login Credentials
+## Monitoring
 
-| Role | Username | Password |
-|------|----------|----------|
-| Admin | `admin` | `admin123` |
-| Receptionist | `receptionist` | `recep123` |
-| Doctor 1 | `doctor1` | `doc123` |
+The compose stack now includes Prometheus and Grafana.
 
----
+- Prometheus: `http://127.0.0.1:9090`
+- Grafana: `http://127.0.0.1:3000`
 
-## API Reference
+Grafana is provisioned with:
 
-### Authentication
+- a Prometheus datasource
+- a starter dashboard at `Hospital Operations Overview`
+
+Additional KPIs and signals now exposed:
+
+- scheduling latency (`hospital_scheduling_latency_seconds`)
+- reassignment totals (`hospital_reassignment_total`)
+- predicted wait time (`hospital_predicted_wait_minutes`)
+- NLP duration (`hospital_nlp_duration_seconds`)
+- worker heartbeat age (`hospital_worker_heartbeat_age_seconds`)
+- DB and Redis status (`hospital_db_up`, `hospital_redis_up`)
+- pending summaries and overload risk (`hospital_summaries_pending`, `hospital_overload_risk_doctors`)
+- forecast quality (`hospital_forecast_quality_mae`, `hospital_forecast_quality_rmse`)
+
+Prometheus alert rules are included in `monitoring/prometheus/alerts.yml`.
+
+These ports are bound to localhost by default so they are not exposed publicly on EC2 unless you deliberately reconfigure them.
+
+## Security Notes
+
+- Only the frontend ports (`8080`, `8443`) are published by default.
+- Redis and the Flask API are internal-only in `docker-compose.yml`.
+- Privileged self-registration is disabled by default.
+- Demo data is off by default (`SEED_DEMO_DATA=False`).
+- A bootstrap admin can be created with:
+  - `BOOTSTRAP_ADMIN_USERNAME`
+  - `BOOTSTRAP_ADMIN_PASSWORD`
+  - `BOOTSTRAP_ADMIN_EMAIL`
+- Registration now enforces password complexity (12+ chars, upper/lower/number/special).
+- Login lockout is enabled after repeated failures (`LOGIN_MAX_FAILED_ATTEMPTS`, `LOGIN_LOCKOUT_MINUTES`).
+- Audit logs are append-only at the model layer and support hash-chain integrity checks via `GET /api/audit/integrity`.
+- In production/staging, CORS uses `CORS_ORIGINS_PRODUCTION` (localhost origins are stripped).
+- Access/refresh token session flow is supported:
+  - `POST /api/auth/refresh`
+  - `POST /api/auth/logout`
+  - `POST /api/auth/logout-all`
+- Security event log endpoint: `GET /api/security/events`
+- Optional SIEM webhook forwarding via:
+  - `SECURITY_EVENT_EXPORT_ENABLED`
+  - `SECURITY_EVENT_WEBHOOK_URL`
+  - `SECURITY_EVENT_WEBHOOK_TIMEOUT_SECONDS`
+  - `SECURITY_EVENT_WEBHOOK_TOKEN`
+
+## Database And Migrations
+
+- Alembic migrations live in `backend/alembic/`.
+- API starts with `AUTO_RUN_MIGRATIONS=True` by default in compose.
+- Runtime `ALTER TABLE` patching has been removed from app startup.
+- Persisted operational tables include:
+  - `forecast_history`
+  - `auth_sessions`
+  - `security_events`
+  - `async_task_events`
+  - `clinical_summary_revisions`
+
+Manual migration command:
+
+```bash
+.venv\Scripts\python.exe -m alembic -c backend/alembic.ini upgrade head
 ```
-POST /api/auth/login          { username, password }
-POST /api/auth/register       { username, password, role, email }
-GET  /api/auth/me
+
+## Forecasting And NLP Modes
+
+Baseline behavior works with the default dependencies.
+
+Optional advanced dependencies are listed in `backend/requirements-advanced.txt`.
+
+Relevant `.env` switches:
+
+- `FORECAST_MODEL=baseline|arima|lightgbm|auto`
+- `ENABLE_TRANSFORMER_SUMMARIZATION=True|False`
+- `TRANSFORMER_MODEL_NAME=...`
+
+If advanced libraries are unavailable, the app falls back to the baseline forecasting/NLP paths instead of crashing.
+
+Forecast API additions:
+
+- model comparison metadata
+- backtest sample output
+- MAE/RMSE fields (when available)
+- persisted history endpoint: `GET /api/forecast/history`
+
+Clinical summary workflow additions:
+
+- generation mode output (`queued` / `sync` / `sync-fallback`)
+- clinician review endpoint: `PUT /api/summaries/<id>/review`
+- revision history endpoint: `GET /api/summaries/<id>/revisions`
+
+## Backups And Restore
+
+Celery Beat runs a backup task every 15 minutes.
+
+- SQLite backup output: `.db`
+- PostgreSQL backup output: `.sql` (requires `pg_dump`, now installed in backend image)
+- Backup task returns SHA-256 checksum for integrity verification
+
+Useful scripts:
+
+```bash
+python scripts/check_stack.py
+python scripts/restore_backup.py --backup-dir ./backups
+python scripts/run_dr_drill.py --backup-dir ./backups --output ./dr_drill_report.json
 ```
 
-### Appointments
-```
-GET  /api/appointments        ?status=booked&date=2026-02-09&page=1
-POST /api/appointments        { patient_id, specialty, scheduled_at, priority, notes }
-PUT  /api/appointments/:id/complete   { notes }
-PUT  /api/appointments/:id/cancel     { reason }
-```
+Restore helper supports:
 
-### Scheduling / Workload
-```
-GET  /api/doctors/workloads              All doctor workload scores
-GET  /api/doctors/:id/workload           Single doctor score
-GET  /api/forecast/best-doctor?specialty=Cardiology&at=2026-02-09T10:00
-```
+- SQLite restore to local DB path
+- PostgreSQL restore via `psql` when `DATABASE_URL` is PostgreSQL
+- Optional integrity check: `--verify-sha256 <digest>`
+- DR verification output: `--dr-report`
 
-### Forecasting
-```
-GET  /api/forecast/workload?doctor_id=1&horizon=120
-GET  /api/forecast/demand?hours=4
-```
+`check_stack.py` defaults to frontend-proxied endpoints (`http://localhost:8080`) and can be overridden with:
 
-### Clinical Summaries
-```
-GET  /api/summaries/:appointment_id
-POST /api/summaries/:appointment_id/regenerate
-```
+- `HOSPITAL_FRONTEND_BASE` (for frontend/proxy checks)
+- `HOSPITAL_API_BASE` (direct API host, with or without `/api` suffix)
 
-### Dashboard & Audit
-```
-GET  /api/dashboard
-GET  /api/audit              (admin only)
-GET  /api/notifications
-GET  /metrics                (Prometheus format)
-```
+`run_dr_drill.py` executes a restore drill and writes machine-readable evidence (`dr_drill_report.json`) including:
 
----
+- drill start/end timestamps
+- restore command/exit status
+- captured restore `DR_REPORT` payload
 
-## Workload Score Formula
+Operational APIs:
 
-```
-score = 0.40 × appointment_ratio
-      + 0.30 × avg_consult_pressure
-      + 0.20 × cancellation_penalty
-      + 0.10 × queue_pressure
+- `GET /api/ops/worker-status`
+- `GET /api/ops/tasks/events`
 
-Overload threshold = 0.85
+## EC2 Notes
+
+For the current compose setup, you normally only need inbound rules for:
+
+- `22` for SSH / EC2 Instance Connect
+- `8080` for HTTP access
+- `8443` for HTTPS access
+
+Do not expose `5000` or `6379` publicly.
+
+## Testing
+
+Run the verification suite with the project virtualenv:
+
+```bash
+.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-When a doctor's score exceeds the threshold, the Smart Appointment Load Balancer
-automatically reassigns incoming bookings to the next available doctor with the
-lowest workload score.
+## Demo Credentials
 
----
+If `SEED_DEMO_DATA=True`, the default seeded users are:
 
-## Reliability Targets
+- admin / admin123
+- receptionist / recep123
+- doctor1 / doc123
 
-| Metric | Target |
-|--------|--------|
-| Availability | 99.9% |
-| RPO | 15 minutes |
-| RTO | 30 minutes |
-| Forecast cadence | 30–60 seconds |
-
-Current implementation notes:
-- Backups run every 15 minutes to align with RPO target.
-- Retention is configurable via `BACKUP_RETENTION_HOURS`.
-- Backup location is configurable via `BACKUP_DIR`.
-
----
-
-## Simulation Parameters (Data & Methodology)
-
-- Doctors: 30–50
-- Patients/day: 400–600 (Poisson distribution)
-- Avg consultation: 8–12 minutes
-- Cancellation rate: 10–15%
-
----
-
-## Project Structure
-
-```
-hospital-ops/
-├── backend/
-│   ├── app.py              # Flask API + all routes
-│   ├── config.py           # Configuration
-│   ├── models.py           # SQLAlchemy ORM models
-│   ├── auth.py             # JWT auth + RBAC middleware
-│   ├── scheduler.py        # Smart Appointment Load Balancer
-│   ├── forecaster.py       # Workload forecasting engine
-│   ├── nlp.py              # Clinical NLP processor
-│   ├── tasks.py            # Celery async tasks
-│   ├── celery_worker.py    # Celery entry point
-│   ├── requirements.txt
-│   └── Dockerfile
-├── frontend/
-│   └── index.html          # Vue.js 3 SPA dashboard
-├── docker-compose.yml
-├── .env.example
-└── README.md
-```
+Use seeded users only for demos, not public deployment.

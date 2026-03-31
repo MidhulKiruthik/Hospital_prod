@@ -14,7 +14,7 @@ Overload threshold: 0.85
 """
 
 from datetime import datetime, timedelta, date
-from models import Doctor, Appointment, WorkloadMetric, Notification, db
+from models import Doctor, Appointment, WorkloadMetric, Notification, DoctorAvailabilityCompat, db
 from sqlalchemy import func
 import json
 
@@ -22,6 +22,61 @@ import json
 MAX_PER_DAY = 40
 OVERLOAD_THRESHOLD = 0.85
 EMERGENCY_MAX_OVERRIDE = True   # emergency always gets slot
+
+
+def _parse_hhmm(value: str):
+    try:
+        return datetime.strptime((value or '').strip(), '%H:%M').time()
+    except Exception:
+        return None
+
+
+def _slot_conflicts_break(check_time, break_start: str, break_end: str) -> bool:
+    b_start = _parse_hhmm(break_start)
+    b_end = _parse_hhmm(break_end)
+    if not b_start or not b_end:
+        return False
+    if b_start >= b_end:
+        return False
+    return b_start <= check_time < b_end
+
+
+def _is_doctor_available_for_slot(doctor_id: int, scheduled_at: datetime) -> tuple:
+    weekday = scheduled_at.strftime('%A')
+    cfg = DoctorAvailabilityCompat.query.filter_by(
+        doctor_id=doctor_id,
+        day_of_week=weekday,
+    ).first()
+    if not cfg:
+        return True, ''
+
+    slot_time = scheduled_at.time()
+    start_t = _parse_hhmm(cfg.start_time or '09:00')
+    end_t = _parse_hhmm(cfg.end_time or '17:00')
+    if not start_t or not end_t or start_t >= end_t:
+        return False, 'Doctor availability configuration is invalid for this day'
+
+    if not (start_t <= slot_time < end_t):
+        return False, 'Requested time is outside doctor availability window'
+
+    if _slot_conflicts_break(slot_time, cfg.break_start, cfg.break_end):
+        return False, 'Requested time falls within doctor break window'
+
+    return True, ''
+
+
+def _has_double_booking(doctor_id: int, scheduled_at: datetime) -> bool:
+    return Appointment.query.filter(
+        Appointment.doctor_id == doctor_id,
+        Appointment.scheduled_at == scheduled_at,
+        Appointment.status == 'booked',
+    ).first() is not None
+
+
+def estimate_wait_minutes(doctor_id: int, scheduled_at: datetime) -> int:
+    ws = compute_workload_score(doctor_id, scheduled_at.date())
+    queue_now = int(ws.get('queue_now', 0))
+    return max(0, queue_now * 10)
 
 
 def compute_workload_score(doctor_id: int, target_date: date = None) -> dict:
@@ -129,8 +184,13 @@ def find_best_doctor(specialty: str, scheduled_at: datetime,
     scored = []
     target_date = scheduled_at.date()
     for doc in doctors:
+        available, reason = _is_doctor_available_for_slot(doc.id, scheduled_at)
+        if not available and priority != 'emergency':
+            continue
         ws = compute_workload_score(doc.id, target_date)
         if not ws['available']:
+            continue
+        if _has_double_booking(doc.id, scheduled_at):
             continue
         # Emergency always gets through even if overloaded
         if ws['overloaded'] and priority != 'emergency':
@@ -185,6 +245,12 @@ def book_appointment(patient_id: int, specialty: str, scheduled_at: datetime,
     ws = None
 
     if preferred_doctor_id:
+        available, reason = _is_doctor_available_for_slot(preferred_doctor_id, scheduled_at)
+        if not available and priority != 'emergency':
+            return {'error': reason}
+        if _has_double_booking(preferred_doctor_id, scheduled_at):
+            return {'error': 'Requested slot is already booked for the selected doctor'}
+
         ws = compute_workload_score(preferred_doctor_id, scheduled_at.date())
         if ws['overloaded'] and priority != 'emergency':
             # Trigger reassignment
@@ -195,6 +261,9 @@ def book_appointment(patient_id: int, specialty: str, scheduled_at: datetime,
                 result['reassigned'] = True
                 result['overload_triggered'] = True
                 result['original_doctor_id'] = preferred_doctor_id
+                result['overload_explanation'] = (
+                    f"Preferred doctor score {ws['score']:.2f} exceeded threshold {OVERLOAD_THRESHOLD:.2f}."
+                )
                 result['message'] = (
                     f"Preferred doctor at capacity (score={ws['score']:.2f}). "
                     f"Reassigned to {alt['doctor_name']}."
@@ -207,6 +276,12 @@ def book_appointment(patient_id: int, specialty: str, scheduled_at: datetime,
             return {'error': alt.get('reason', 'No available doctor')}
         doctor_id = alt['doctor_id']
         ws = alt.get('workload_details', {})
+
+    available, reason = _is_doctor_available_for_slot(doctor_id, scheduled_at)
+    if not available and priority != 'emergency':
+        return {'error': reason}
+    if _has_double_booking(doctor_id, scheduled_at):
+        return {'error': 'Requested slot is already booked for this doctor'}
 
     # Create the appointment
     appt = Appointment(
@@ -234,8 +309,22 @@ def book_appointment(patient_id: int, specialty: str, scheduled_at: datetime,
 
     db.session.commit()
 
+    if result.get('reassigned', False):
+        note = Notification(
+            user_id=None,
+            message=(
+                f"Appointment #{appt.id} reassigned from doctor {result.get('original_doctor_id')} "
+                f"to doctor {doctor_id}."
+            ),
+            type='warning',
+        )
+        db.session.add(note)
+        db.session.commit()
+
     result['appointment'] = appt
     result['doctor_id'] = doctor_id
+    result['predicted_wait_minutes'] = estimate_wait_minutes(doctor_id, scheduled_at)
+    result['reassignment_success'] = bool(result.get('reassigned', False))
     if 'message' not in result:
         result['message'] = 'Appointment booked successfully.'
 

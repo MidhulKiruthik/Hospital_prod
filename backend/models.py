@@ -1,6 +1,7 @@
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 import json
+from sqlalchemy import event, UniqueConstraint, Index
 
 db = SQLAlchemy()
 
@@ -13,6 +14,10 @@ class User(db.Model):
     role        = db.Column(db.String(32), nullable=False)   # admin|doctor|receptionist|patient
     email       = db.Column(db.String(128), unique=True)
     created_at  = db.Column(db.DateTime, default=datetime.utcnow)
+    failed_login_attempts = db.Column(db.Integer, default=0, nullable=False)
+    lockout_until = db.Column(db.DateTime, nullable=True)
+    last_login_at = db.Column(db.DateTime, nullable=True)
+    token_version = db.Column(db.Integer, default=0, nullable=False)
 
     def to_dict(self):
         return {'id': self.id, 'username': self.username,
@@ -55,6 +60,10 @@ class Patient(db.Model):
 
 class Appointment(db.Model):
     __tablename__ = 'appointments'
+    __table_args__ = (
+        Index('ix_appointments_doctor_time_status', 'doctor_id', 'scheduled_at', 'status'),
+        Index('ix_appointments_patient_time', 'patient_id', 'scheduled_at'),
+    )
     id          = db.Column(db.Integer, primary_key=True)
     patient_id  = db.Column(db.Integer, db.ForeignKey('patients.id'), nullable=False)
     doctor_id   = db.Column(db.Integer, db.ForeignKey('doctors.id'), nullable=False)
@@ -94,6 +103,13 @@ class ClinicalSummary(db.Model):
     assessment      = db.Column(db.Text, default='')
     plan            = db.Column(db.Text, default='')
     status          = db.Column(db.String(16), default='pending')  # pending|ready|error
+    generation_method = db.Column(db.String(64), default='rule-based-nlp')
+    generation_model  = db.Column(db.String(128), default='')
+    source_notes_hash = db.Column(db.String(64), default='')
+    is_reviewed = db.Column(db.Boolean, default=False)
+    reviewed_by_user_id = db.Column(db.Integer, nullable=True)
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    review_notes = db.Column(db.Text, default='')
     generated_at    = db.Column(db.DateTime, default=datetime.utcnow)
     processing_time_s = db.Column(db.Float, default=0.0)
 
@@ -107,8 +123,37 @@ class ClinicalSummary(db.Model):
             'assessment': self.assessment,
             'plan': self.plan,
             'status': self.status,
+            'generation_method': self.generation_method,
+            'generation_model': self.generation_model,
+            'source_notes_hash': self.source_notes_hash,
+            'is_reviewed': self.is_reviewed,
+            'reviewed_by_user_id': self.reviewed_by_user_id,
+            'reviewed_at': self.reviewed_at.isoformat() if self.reviewed_at else None,
+            'review_notes': self.review_notes,
             'generated_at': self.generated_at.isoformat() if self.generated_at else None,
             'processing_time_s': self.processing_time_s,
+        }
+
+
+class ClinicalSummaryRevision(db.Model):
+    __tablename__ = 'clinical_summary_revisions'
+    id = db.Column(db.Integer, primary_key=True)
+    summary_id = db.Column(db.Integer, db.ForeignKey('clinical_summaries.id'), nullable=False)
+    edited_by_user_id = db.Column(db.Integer, nullable=True)
+    previous_summary_text = db.Column(db.Text, default='')
+    new_summary_text = db.Column(db.Text, default='')
+    edit_note = db.Column(db.Text, default='')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'summary_id': self.summary_id,
+            'edited_by_user_id': self.edited_by_user_id,
+            'previous_summary_text': self.previous_summary_text,
+            'new_summary_text': self.new_summary_text,
+            'edit_note': self.edit_note,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
         }
 
 
@@ -121,6 +166,40 @@ class WorkloadMetric(db.Model):
     queue_length = db.Column(db.Integer, default=0)
     completed_today = db.Column(db.Integer, default=0)
     cancelled_today = db.Column(db.Integer, default=0)
+
+
+class ForecastHistory(db.Model):
+    __tablename__ = 'forecast_history'
+    id = db.Column(db.Integer, primary_key=True)
+    scope = db.Column(db.String(16), nullable=False)  # hospital|doctor
+    scope_id = db.Column(db.Integer, nullable=True)
+    selected_model = db.Column(db.String(32), default='baseline')
+    effective_model = db.Column(db.String(64), default='')
+    horizon_minutes = db.Column(db.Integer, default=120)
+    peak_predicted = db.Column(db.Float, default=0.0)
+    avg_predicted = db.Column(db.Float, default=0.0)
+    overload_expected = db.Column(db.Boolean, default=False)
+    mae = db.Column(db.Float, nullable=True)
+    rmse = db.Column(db.Float, nullable=True)
+    payload_json = db.Column(db.Text, default='{}')
+    generated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'scope': self.scope,
+            'scope_id': self.scope_id,
+            'selected_model': self.selected_model,
+            'effective_model': self.effective_model,
+            'horizon_minutes': self.horizon_minutes,
+            'peak_predicted': self.peak_predicted,
+            'avg_predicted': self.avg_predicted,
+            'overload_expected': self.overload_expected,
+            'mae': self.mae,
+            'rmse': self.rmse,
+            'payload': json.loads(self.payload_json or '{}'),
+            'generated_at': self.generated_at.isoformat() if self.generated_at else None,
+        }
 
     def to_dict(self):
         return {
@@ -141,6 +220,8 @@ class AuditLog(db.Model):
     entity_id   = db.Column(db.Integer, nullable=True)
     details     = db.Column(db.Text, default='{}')
     ip_address  = db.Column(db.String(64), default='')
+    previous_hash = db.Column(db.String(64), default='')
+    entry_hash = db.Column(db.String(64), default='', nullable=False)
 
     def to_dict(self):
         return {
@@ -150,7 +231,19 @@ class AuditLog(db.Model):
             'entity_type': self.entity_type,
             'entity_id': self.entity_id,
             'details': json.loads(self.details) if self.details else {},
+            'previous_hash': self.previous_hash,
+            'entry_hash': self.entry_hash,
         }
+
+
+@event.listens_for(AuditLog, 'before_update')
+def _prevent_audit_update(mapper, connection, target):
+    raise ValueError('Audit logs are append-only and cannot be updated')
+
+
+@event.listens_for(AuditLog, 'before_delete')
+def _prevent_audit_delete(mapper, connection, target):
+    raise ValueError('Audit logs are append-only and cannot be deleted')
 
 
 class Notification(db.Model):
@@ -238,6 +331,9 @@ class PatientProfileCompat(db.Model):
 
 class DoctorAvailabilityCompat(db.Model):
     __tablename__ = 'doctor_availability_compat'
+    __table_args__ = (
+        UniqueConstraint('doctor_id', 'day_of_week', name='uq_doctor_day_availability'),
+    )
     id            = db.Column(db.Integer, primary_key=True)
     doctor_id      = db.Column(db.Integer, db.ForeignKey('doctors.id'), nullable=False)
     day_of_week   = db.Column(db.String(16), nullable=False)
@@ -297,6 +393,9 @@ class PaymentOrderCompat(db.Model):
     reason        = db.Column(db.Text, default='')
     amount_cents  = db.Column(db.Integer, default=0)
     status        = db.Column(db.String(16), default='created')
+    failure_reason = db.Column(db.String(255), default='')
+    razorpay_payment_id = db.Column(db.String(64), default='')
+    verification_attempts = db.Column(db.Integer, default=0)
     created_at    = db.Column(db.DateTime, default=datetime.utcnow)
 
     def to_dict(self):
@@ -309,5 +408,68 @@ class PaymentOrderCompat(db.Model):
             'reason': self.reason,
             'amount_cents': self.amount_cents,
             'status': self.status,
+            'failure_reason': self.failure_reason,
+            'razorpay_payment_id': self.razorpay_payment_id,
+            'verification_attempts': self.verification_attempts,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AuthSession(db.Model):
+    __tablename__ = 'auth_sessions'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    refresh_token_hash = db.Column(db.String(64), nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_seen_at = db.Column(db.DateTime, nullable=True)
+    ip_address = db.Column(db.String(64), default='')
+    user_agent = db.Column(db.String(255), default='')
+
+    def is_active(self):
+        return self.revoked_at is None and self.expires_at > datetime.utcnow()
+
+
+class SecurityEvent(db.Model):
+    __tablename__ = 'security_events'
+    id = db.Column(db.Integer, primary_key=True)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    event_type = db.Column(db.String(64), nullable=False)
+    severity = db.Column(db.String(16), default='medium')
+    user_id = db.Column(db.Integer, nullable=True)
+    source_ip = db.Column(db.String(64), default='')
+    request_path = db.Column(db.String(255), default='')
+    details_json = db.Column(db.Text, default='{}')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+            'event_type': self.event_type,
+            'severity': self.severity,
+            'user_id': self.user_id,
+            'source_ip': self.source_ip,
+            'request_path': self.request_path,
+            'details': json.loads(self.details_json or '{}'),
+        }
+
+
+class AsyncTaskEvent(db.Model):
+    __tablename__ = 'async_task_events'
+    id = db.Column(db.Integer, primary_key=True)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    task_name = db.Column(db.String(128), nullable=False)
+    status = db.Column(db.String(32), nullable=False)  # started|success|retry|error|skipped
+    retry_count = db.Column(db.Integer, default=0)
+    details_json = db.Column(db.Text, default='{}')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+            'task_name': self.task_name,
+            'status': self.status,
+            'retry_count': self.retry_count,
+            'details': json.loads(self.details_json or '{}'),
         }

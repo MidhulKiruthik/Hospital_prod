@@ -16,7 +16,42 @@ import time
 import json
 from datetime import datetime, date
 from urllib.parse import urlparse
+import subprocess
+import hashlib
 from security_utils import encrypt_text
+
+
+def _record_forecast_history_row(scope: str, scope_id, payload: dict):
+    from models import db, ForecastHistory
+
+    row = ForecastHistory(
+        scope=scope,
+        scope_id=scope_id,
+        selected_model=str(payload.get('selected_model', 'baseline')),
+        effective_model=str(payload.get('effective_model', '')),
+        horizon_minutes=int(payload.get('horizon_minutes', 120)),
+        peak_predicted=float(payload.get('peak_predicted', 0.0)),
+        avg_predicted=float(payload.get('avg_predicted', 0.0)),
+        overload_expected=bool(payload.get('overload_expected', False)),
+        payload_json=json.dumps(payload, sort_keys=True),
+    )
+    db.session.add(row)
+
+
+def _log_task_event(task_name: str, status: str, details: dict = None, retry_count: int = 0):
+    try:
+        from models import db, AsyncTaskEvent
+
+        row = AsyncTaskEvent(
+            task_name=task_name,
+            status=status,
+            retry_count=retry_count,
+            details_json=json.dumps(details or {}, sort_keys=True),
+        )
+        db.session.add(row)
+        db.session.commit()
+    except Exception:
+        return
 
 # ── Celery app factory ────────────────────────────────────────────────────────
 
@@ -83,6 +118,7 @@ def generate_clinical_summary_task(self, appointment_id: int, notes: str):
     Triggered OUTSIDE the API critical path after appointment completion.
     """
     try:
+        _log_task_event('generate_clinical_summary', 'started', {'appointment_id': appointment_id}, self.request.retries)
         from app import create_app
         flask_app = create_app()
         with flask_app.app_context():
@@ -124,12 +160,32 @@ def generate_clinical_summary_task(self, appointment_id: int, notes: str):
             summary.assessment      = encrypt_text(result['assessment'])
             summary.plan            = encrypt_text(result['plan'])
             summary.status          = result['status']
+            summary.generation_method = result.get('method', 'rule-based-nlp')
+            summary.generation_model = result.get('model_name', '')
             summary.processing_time_s = result['processing_time_s']
+            summary.source_notes_hash = hashlib.sha256((notes or '').encode('utf-8')).hexdigest()
+            summary.is_reviewed = False
+            summary.reviewed_by_user_id = None
+            summary.reviewed_at = None
+            summary.review_notes = ''
             summary.generated_at    = datetime.utcnow()
             db.session.commit()
 
+            try:
+                from app import NLP_DURATION_SECONDS
+                NLP_DURATION_SECONDS.labels(mode='async').observe(max(float(result['processing_time_s']), 0.0))
+            except Exception:
+                pass
+
             # Send notification
             notify_summary_ready.delay(appointment_id)
+
+            _log_task_event(
+                'generate_clinical_summary',
+                'success',
+                {'appointment_id': appointment_id, 'processing_time_s': result['processing_time_s']},
+                self.request.retries,
+            )
 
             return {
                 'status': 'ready',
@@ -138,6 +194,12 @@ def generate_clinical_summary_task(self, appointment_id: int, notes: str):
             }
 
     except Exception as exc:
+        _log_task_event(
+            'generate_clinical_summary',
+            'retry',
+            {'appointment_id': appointment_id, 'error': str(exc)},
+            self.request.retries,
+        )
         raise self.retry(exc=exc)
 
 
@@ -147,6 +209,7 @@ def generate_clinical_summary_task(self, appointment_id: int, notes: str):
 def send_notification_task(user_id: int, message: str, notif_type: str = 'info'):
     """Async notification dispatch."""
     try:
+        _log_task_event('send_notification', 'started', {'user_id': user_id})
         from app import create_app
         flask_app = create_app()
         with flask_app.app_context():
@@ -158,8 +221,10 @@ def send_notification_task(user_id: int, message: str, notif_type: str = 'info')
             )
             db.session.add(notif)
             db.session.commit()
+            _log_task_event('send_notification', 'success', {'user_id': user_id})
             return {'status': 'sent', 'user_id': user_id}
     except Exception as e:
+        _log_task_event('send_notification', 'error', {'user_id': user_id, 'error': str(e)})
         return {'status': 'error', 'message': str(e)}
 
 
@@ -197,6 +262,7 @@ def snapshot_workload_metrics():
     Feeds the forecasting engine's rolling window.
     """
     try:
+        _log_task_event('snapshot_workload_metrics', 'started')
         from app import create_app
         flask_app = create_app()
         with flask_app.app_context():
@@ -216,8 +282,10 @@ def snapshot_workload_metrics():
                 db.session.add(metric)
                 count += 1
             db.session.commit()
+            _log_task_event('snapshot_workload_metrics', 'success', {'snapshots': count})
             return {'status': 'ok', 'snapshots': count, 'at': datetime.utcnow().isoformat()}
     except Exception as e:
+        _log_task_event('snapshot_workload_metrics', 'error', {'error': str(e)})
         return {'status': 'error', 'message': str(e)}
 
 
@@ -229,27 +297,36 @@ def update_all_forecasts():
     Periodic task (every 60s): recompute forecasts and cache in Redis.
     """
     try:
+        _log_task_event('update_all_forecasts', 'started')
         import redis as redis_lib
         r = redis_lib.from_url(os.environ.get('REDIS_URL', 'redis://localhost:6379/0'))
 
         from app import create_app
         flask_app = create_app()
         with flask_app.app_context():
-            from models import Doctor
+            from models import db, Doctor
             from forecaster import forecast_workload, forecast_patient_demand
 
             # Hospital-level demand forecast
             demand = forecast_patient_demand(horizon_hours=4)
             r.setex('forecast:demand', 120, json.dumps(demand))
+            hospital_forecast = forecast_workload(doctor_id=None, horizon_minutes=120)
+            r.setex('forecast:hospital', 120, json.dumps(hospital_forecast))
+            _record_forecast_history_row('hospital', None, hospital_forecast)
 
             # Per-doctor workload forecast
             doctors = Doctor.query.filter_by(is_available=True).all()
             for doc in doctors:
                 wf = forecast_workload(doc.id, horizon_minutes=120)
                 r.setex(f'forecast:doctor:{doc.id}', 120, json.dumps(wf))
+                _record_forecast_history_row('doctor', doc.id, wf)
 
+            db.session.commit()
+
+        _log_task_event('update_all_forecasts', 'success', {'doctors_updated': len(doctors)})
         return {'status': 'ok', 'doctors_updated': len(doctors)}
     except Exception as e:
+        _log_task_event('update_all_forecasts', 'error', {'error': str(e)})
         return {'status': 'error', 'message': str(e)}
 
 
@@ -268,14 +345,14 @@ def _resolve_sqlite_path() -> str:
     return db_url.replace('sqlite:///', '', 1)
 
 
-def _cleanup_old_backups(backup_dir: str, retention_hours: int) -> int:
+def _cleanup_old_backups(backup_dir: str, retention_hours: int, extension: str) -> int:
     removed = 0
     if retention_hours <= 0:
         return removed
 
     cutoff = datetime.utcnow().timestamp() - (retention_hours * 3600)
     for name in os.listdir(backup_dir):
-        if not name.endswith('.db'):
+        if not name.endswith(extension):
             continue
         path = os.path.join(backup_dir, name)
         try:
@@ -290,25 +367,39 @@ def _cleanup_old_backups(backup_dir: str, retention_hours: int) -> int:
 def run_backup():
     """Periodic backup task aligned to 15-minute RPO target."""
     try:
+        _log_task_event('run_backup', 'started')
         import shutil
+        import hashlib
 
+        db_url = os.environ.get('DATABASE_URL', 'sqlite:///hospital.db').strip()
+        parsed = urlparse(db_url)
         src = _resolve_sqlite_path()
         backup_dir = os.environ.get('BACKUP_DIR', '/data/backups')
         retention_hours = int(os.environ.get('BACKUP_RETENTION_HOURS', '48'))
 
-        if not src:
-            return {'status': 'error', 'message': 'Backup currently supports SQLite only'}
-
         os.makedirs(backup_dir, exist_ok=True)
-        backup_name = f"hospital_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
 
-        if os.path.exists(src):
+        if parsed.scheme == 'sqlite':
+            backup_name = f"hospital_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
+            if not src:
+                return {'status': 'error', 'message': 'Unable to resolve SQLite path'}
+            if not os.path.exists(src):
+                return {'status': 'error', 'message': f'Database source not found: {src}'}
+
             target = os.path.join(backup_dir, backup_name)
             shutil.copy2(src, target)
-            removed = _cleanup_old_backups(backup_dir, retention_hours)
+
+            digest = hashlib.sha256()
+            with open(target, 'rb') as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                    digest.update(chunk)
+
+            removed = _cleanup_old_backups(backup_dir, retention_hours, '.db')
+            _log_task_event('run_backup', 'success', {'backup': backup_name, 'source': src})
             return {
                 'status': 'ok',
                 'backup': backup_name,
+                'sha256': digest.hexdigest(),
                 'source': src,
                 'backup_dir': backup_dir,
                 'retention_hours': retention_hours,
@@ -316,6 +407,51 @@ def run_backup():
                 'at': datetime.utcnow().isoformat(),
             }
 
-        return {'status': 'error', 'message': f'Database source not found: {src}'}
+        if parsed.scheme.startswith('postgres'):
+            backup_name = f"hospital_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.sql"
+            target = os.path.join(backup_dir, backup_name)
+            command = [
+                'pg_dump',
+                db_url,
+                '--no-owner',
+                '--no-privileges',
+                '--format=plain',
+                '--file',
+                target,
+            ]
+            try:
+                subprocess.run(command, check=True, capture_output=True)
+            except FileNotFoundError:
+                _log_task_event('run_backup', 'error', {'error': 'pg_dump not found'})
+                return {
+                    'status': 'error',
+                    'message': 'pg_dump not found. Install PostgreSQL client tools in worker image.',
+                }
+            except subprocess.CalledProcessError as exc:
+                stderr = (exc.stderr or b'').decode('utf-8', errors='ignore')
+                _log_task_event('run_backup', 'error', {'error': stderr.strip() or str(exc)})
+                return {'status': 'error', 'message': f'pg_dump failed: {stderr.strip() or exc}'}
+
+            digest = hashlib.sha256()
+            with open(target, 'rb') as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                    digest.update(chunk)
+
+            removed = _cleanup_old_backups(backup_dir, retention_hours, '.sql')
+            _log_task_event('run_backup', 'success', {'backup': backup_name, 'source': 'postgres'})
+            return {
+                'status': 'ok',
+                'backup': backup_name,
+                'sha256': digest.hexdigest(),
+                'source': 'postgres',
+                'backup_dir': backup_dir,
+                'retention_hours': retention_hours,
+                'removed_old_backups': removed,
+                'at': datetime.utcnow().isoformat(),
+            }
+
+        _log_task_event('run_backup', 'skipped', {'reason': f'Unsupported scheme {parsed.scheme}'})
+        return {'status': 'error', 'message': f'Unsupported DATABASE_URL scheme: {parsed.scheme}'}
     except Exception as e:
+        _log_task_event('run_backup', 'error', {'error': str(e)})
         return {'status': 'error', 'message': str(e)}
