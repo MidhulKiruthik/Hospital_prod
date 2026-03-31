@@ -1,0 +1,21 @@
+flask==3.0.3
+flask-sqlalchemy==3.1.1
+flask-cors==4.0.1
+flask-limiter==3.8.0
+sqlalchemy==2.0.31
+celery==5.4.0
+redis==5.0.7
+PyJWT==2.9.0
+werkzeug==3.0.4
+python-dotenv==1.0.1
+kombu==5.3.4
+prometheus-client==0.20.0
+cryptography==43.0.1
+
+# Optional: ML & NLP (comment out if not needed for prototype)
+# scikit-learn==1.5.1
+# lightgbm==4.4.0
+# statsmodels==0.14.3
+# transformers==4.44.0
+# torch==2.4.0
+# tokenizers==0.19.1

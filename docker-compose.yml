@@ -1,0 +1,103 @@
+services:
+
+  redis:
+    image: redis:6-alpine
+    container_name: hospital_redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hospital_api
+    ports:
+      - "5000:5000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-hospital-ops-secret-2026}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-jwt-hospital-secret-2026}
+      - DATA_ENCRYPTION_KEY=${DATA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID:-rzp_test_SXY57KDTSDiRGZ}
+      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET:-wh6TKP4Pe1Qi5Yj5mOKHx3ZD}
+      - RAZORPAY_SIGNATURE_REQUIRED=${RAZORPAY_SIGNATURE_REQUIRED:-True}
+      - DATABASE_URL=sqlite:////data/hospital.db
+      - DEBUG=False
+      - AUTH_RATE_LIMIT=5 per minute
+      - DEFAULT_RATE_LIMIT=300 per hour
+      - ENABLE_PROMETHEUS_METRICS=True
+      - BACKUP_DIR=/data/backups
+      - BACKUP_RETENTION_HOURS=48
+    volumes:
+      - db_data:/data
+      - ./backend:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: python app.py
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hospital_celery_worker
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-hospital-ops-secret-2026}
+      - DATABASE_URL=sqlite:////data/hospital.db
+      - DATA_ENCRYPTION_KEY=${DATA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      - BACKUP_DIR=/data/backups
+      - BACKUP_RETENTION_HOURS=48
+    volumes:
+      - db_data:/data
+      - ./backend:/app
+    depends_on:
+      - redis
+      - api
+    restart: unless-stopped
+    command: celery -A celery_worker.celery worker --loglevel=info --concurrency=4
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hospital_celery_beat
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-hospital-ops-secret-2026}
+      - DATABASE_URL=sqlite:////data/hospital.db
+      - DATA_ENCRYPTION_KEY=${DATA_ENCRYPTION_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      - BACKUP_DIR=/data/backups
+      - BACKUP_RETENTION_HOURS=48
+    volumes:
+      - db_data:/data
+      - ./backend:/app
+    depends_on:
+      - redis
+      - celery_worker
+    restart: unless-stopped
+    command: celery -A celery_worker.celery beat --loglevel=info
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: hospital_frontend
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - ./frontend:/usr/share/nginx/html
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  db_data:
