@@ -14,11 +14,16 @@ from celery.schedules import crontab
 import os
 import time
 import json
+import logging
+import importlib
 from datetime import datetime, date
 from urllib.parse import urlparse
 import subprocess
 import hashlib
 from security_utils import encrypt_text
+
+
+logger = logging.getLogger(__name__)
 
 
 def _record_forecast_history_row(scope: str, scope_id, payload: dict):
@@ -52,6 +57,93 @@ def _log_task_event(task_name: str, status: str, details: dict = None, retry_cou
         db.session.commit()
     except Exception:
         return
+
+
+def _as_bool_env(name: str, default: str = 'False') -> bool:
+    return os.environ.get(name, default).strip().lower() in ('true', '1', 'yes', 'on')
+
+
+def _upload_file_to_s3(local_path: str, bucket: str, prefix: str, max_attempts: int = 3) -> dict:
+    bucket_name = (bucket or '').strip()
+    object_prefix = (prefix or '').strip().strip('/')
+    attempts = max(1, int(max_attempts))
+
+    if not bucket_name:
+        logger.error('S3 upload skipped: S3_BACKUP_BUCKET is empty')
+        return {
+            'uploaded': False,
+            'error': 'S3_BACKUP_BUCKET is empty',
+        }
+
+    key = f"{object_prefix}/{os.path.basename(local_path)}" if object_prefix else os.path.basename(local_path)
+    sse_mode = os.environ.get('SSE_MODE', '').strip()
+    kms_key_arn = os.environ.get('KMS_KEY_ARN', '').strip()
+    try:
+        boto3_module = importlib.import_module('boto3')
+        botocore_config = importlib.import_module('botocore.config')
+        botocore_exceptions = importlib.import_module('botocore.exceptions')
+        boto_config_cls = getattr(botocore_config, 'Config')
+        boto_core_error = getattr(botocore_exceptions, 'BotoCoreError')
+        client_error = getattr(botocore_exceptions, 'ClientError')
+    except Exception as exc:
+        logger.error('S3 upload skipped: boto3 or botocore unavailable: %s', str(exc))
+        return {
+            'uploaded': False,
+            'bucket': bucket_name,
+            'key': key,
+            'attempts': 0,
+            'error': f'boto3 unavailable: {exc}',
+        }
+
+    client = boto3_module.client(
+        's3',
+        config=boto_config_cls(retries={'max_attempts': attempts, 'mode': 'standard'}),
+    )
+
+    extra_args = {}
+    if sse_mode:
+        extra_args['ServerSideEncryption'] = sse_mode
+    if sse_mode == 'aws:kms' and kms_key_arn:
+        extra_args['SSEKMSKeyId'] = kms_key_arn
+
+    for attempt in range(1, attempts + 1):
+        try:
+            client.upload_file(local_path, bucket_name, key, ExtraArgs=extra_args or None)
+            logger.info('Backup upload success: s3://%s/%s', bucket_name, key)
+            return {
+                'uploaded': True,
+                'bucket': bucket_name,
+                'key': key,
+                'attempts': attempt,
+                'sse_mode': sse_mode,
+                'kms_key_arn': kms_key_arn if sse_mode == 'aws:kms' else '',
+            }
+        except (boto_core_error, client_error, OSError) as exc:
+            logger.error(
+                'Backup upload failed (attempt %s/%s) for s3://%s/%s: %s',
+                attempt,
+                attempts,
+                bucket_name,
+                key,
+                str(exc),
+            )
+            if attempt == attempts:
+                return {
+                    'uploaded': False,
+                    'bucket': bucket_name,
+                    'key': key,
+                    'attempts': attempt,
+                    'error': str(exc),
+                }
+            time.sleep(min(8, 2 ** (attempt - 1)))
+
+    return {
+        'uploaded': False,
+        'bucket': bucket_name,
+        'key': key,
+        'attempts': attempts,
+        'error': 'unknown upload failure',
+    }
 
 # ── Celery app factory ────────────────────────────────────────────────────────
 
@@ -376,8 +468,26 @@ def run_backup():
         src = _resolve_sqlite_path()
         backup_dir = os.environ.get('BACKUP_DIR', '/data/backups')
         retention_hours = int(os.environ.get('BACKUP_RETENTION_HOURS', '48'))
+        s3_upload_enabled = _as_bool_env('S3_BACKUP_UPLOAD_ENABLED', 'True')
+        s3_bucket = os.environ.get('S3_BACKUP_BUCKET', '').strip()
+        s3_prefix = os.environ.get('S3_BACKUP_PREFIX', 'backups').strip()
+        s3_upload_attempts = int(os.environ.get('S3_UPLOAD_MAX_ATTEMPTS', '3'))
 
         os.makedirs(backup_dir, exist_ok=True)
+
+        def _run_s3_upload(path: str) -> dict:
+            if not s3_upload_enabled:
+                return {
+                    'uploaded': False,
+                    'skipped': True,
+                    'reason': 'S3_BACKUP_UPLOAD_ENABLED is False',
+                }
+            return _upload_file_to_s3(
+                local_path=path,
+                bucket=s3_bucket,
+                prefix=s3_prefix,
+                max_attempts=s3_upload_attempts,
+            )
 
         if parsed.scheme == 'sqlite':
             backup_name = f"hospital_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.db"
@@ -395,7 +505,12 @@ def run_backup():
                     digest.update(chunk)
 
             removed = _cleanup_old_backups(backup_dir, retention_hours, '.db')
-            _log_task_event('run_backup', 'success', {'backup': backup_name, 'source': src})
+            s3_upload = _run_s3_upload(target)
+            if s3_upload.get('uploaded'):
+                _log_task_event('run_backup', 'success', {'backup': backup_name, 'source': src, 's3_key': s3_upload.get('key', '')})
+            else:
+                logger.warning('Backup created locally but S3 upload did not complete: %s', s3_upload)
+                _log_task_event('run_backup', 'success', {'backup': backup_name, 'source': src, 's3_upload': s3_upload})
             return {
                 'status': 'ok',
                 'backup': backup_name,
@@ -404,6 +519,7 @@ def run_backup():
                 'backup_dir': backup_dir,
                 'retention_hours': retention_hours,
                 'removed_old_backups': removed,
+                's3_upload': s3_upload,
                 'at': datetime.utcnow().isoformat(),
             }
 
@@ -438,7 +554,12 @@ def run_backup():
                     digest.update(chunk)
 
             removed = _cleanup_old_backups(backup_dir, retention_hours, '.sql')
-            _log_task_event('run_backup', 'success', {'backup': backup_name, 'source': 'postgres'})
+            s3_upload = _run_s3_upload(target)
+            if s3_upload.get('uploaded'):
+                _log_task_event('run_backup', 'success', {'backup': backup_name, 'source': 'postgres', 's3_key': s3_upload.get('key', '')})
+            else:
+                logger.warning('Backup created locally but S3 upload did not complete: %s', s3_upload)
+                _log_task_event('run_backup', 'success', {'backup': backup_name, 'source': 'postgres', 's3_upload': s3_upload})
             return {
                 'status': 'ok',
                 'backup': backup_name,
@@ -447,6 +568,7 @@ def run_backup():
                 'backup_dir': backup_dir,
                 'retention_hours': retention_hours,
                 'removed_old_backups': removed,
+                's3_upload': s3_upload,
                 'at': datetime.utcnow().isoformat(),
             }
 

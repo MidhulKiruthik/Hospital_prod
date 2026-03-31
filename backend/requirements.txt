@@ -13,6 +13,7 @@ python-dotenv==1.0.1
 kombu==5.3.4
 prometheus-client==0.20.0
 cryptography==43.0.1
+boto3>=1.34,<2.0
 
 # Optional: ML & NLP (comment out if not needed for prototype)
 # scikit-learn==1.5.1
