@@ -125,13 +125,63 @@ def _bootstrap_admin(flask_app):
 
 
 def _seed_data():
-    """Seed demo data if DB is empty."""
-    if User.query.count() > 0:
-        return
+    """Seed demo data without overwriting existing users or patient records."""
+    demo_users = _ensure_demo_users()
+    demo_doctors = _ensure_demo_doctors(demo_users['doctor_users'])
+    demo_patients = _ensure_demo_patients()
+    _ensure_demo_appointments(demo_doctors, demo_patients)
 
-    specialties = ['General Medicine', 'Cardiology', 'Orthopedics',
-                   'Pediatrics', 'Neurology', 'ENT', 'Dermatology']
-    doctor_names = [
+
+def _ensure_demo_users():
+    users_by_username = {user.username: user for user in User.query.all()}
+    created = {}
+
+    admin = users_by_username.get('admin')
+    if not admin:
+        admin = User(
+            username='admin',
+            password_hash=hash_password('admin123'),
+            role='admin',
+            email='admin@hospital.local',
+        )
+        db.session.add(admin)
+        db.session.flush()
+    created['admin'] = admin
+
+    receptionist = users_by_username.get('receptionist')
+    if not receptionist:
+        receptionist = User(
+            username='receptionist',
+            password_hash=hash_password('recep123'),
+            role='receptionist',
+            email='reception@hospital.local',
+        )
+        db.session.add(receptionist)
+        db.session.flush()
+    created['receptionist'] = receptionist
+
+    doctor_users = []
+    for i in range(10):
+        username = f'doctor{i + 1}'
+        user = users_by_username.get(username)
+        if not user:
+            user = User(
+                username=username,
+                password_hash=hash_password('doc123'),
+                role='doctor',
+                email=f'{username}@hospital.local',
+            )
+            db.session.add(user)
+            db.session.flush()
+        doctor_users.append(user)
+
+    db.session.commit()
+    created['doctor_users'] = doctor_users
+    return created
+
+
+def _ensure_demo_doctors(doctor_users):
+    doctor_specs = [
         ('Dr. Arjun Sharma',    'General Medicine'),
         ('Dr. Priya Nair',      'Cardiology'),
         ('Dr. Vikram Mehta',    'Orthopedics'),
@@ -143,47 +193,66 @@ def _seed_data():
         ('Dr. Karthik Raj',     'Cardiology'),
         ('Dr. Deepa Pillai',    'Pediatrics'),
     ]
+    existing_by_name = {doctor.name: doctor for doctor in Doctor.query.all()}
+    doctors = []
+    changed = False
+
+    for idx, (name, specialty) in enumerate(doctor_specs):
+        doctor = existing_by_name.get(name)
+        if not doctor:
+            doctor = Doctor(
+                user_id=doctor_users[idx].id if idx < len(doctor_users) else None,
+                name=name,
+                specialty=specialty,
+                max_per_day=35 + (idx % 3) * 5,
+            )
+            db.session.add(doctor)
+            db.session.flush()
+            changed = True
+        elif not doctor.user_id and idx < len(doctor_users):
+            doctor.user_id = doctor_users[idx].id
+            changed = True
+        doctors.append(doctor)
+
+    if changed:
+        db.session.commit()
+    return doctors
+
+
+def _ensure_demo_patients():
     patient_names = [
         'Ramesh Babu', 'Lakshmi Devi', 'Murugan K', 'Sunita Shah',
         'Arun Kumar', 'Padmavathi R', 'Gopal Menon', 'Nalini T',
         'Senthil Kumar', 'Bhavani S', 'Rajan P', 'Usha Rani',
     ]
-
-    # Admin user
-    admin = User(username='admin', password_hash=hash_password('admin123'),
-                 role='admin', email='admin@hospital.local')
-    db.session.add(admin)
-    db.session.flush()
-
-    # Receptionist
-    recep = User(username='receptionist', password_hash=hash_password('recep123'),
-                 role='receptionist', email='reception@hospital.local')
-    db.session.add(recep)
-    db.session.flush()
-
-    # Doctors
-    doctors = []
-    for i, (name, spec) in enumerate(doctor_names):
-        u = User(username=f'doctor{i+1}', password_hash=hash_password('doc123'),
-                 role='doctor', email=f'doctor{i+1}@hospital.local')
-        db.session.add(u)
-        db.session.flush()
-        doc = Doctor(user_id=u.id, name=name, specialty=spec,
-                     max_per_day=35 + (i % 3) * 5)
-        db.session.add(doc)
-        db.session.flush()
-        doctors.append(doc)
-
-    # Patients
+    existing_by_name = {patient.name: patient for patient in Patient.query.all()}
     patients = []
-    for i, name in enumerate(patient_names):
-        p = Patient(name=name, phone=f'98{i:08d}', email=f'patient{i}@mail.com')
-        db.session.add(p)
-        db.session.flush()
-        patients.append(p)
+    changed = False
 
-    # Sample appointments (today + yesterday)
+    for idx, name in enumerate(patient_names):
+        patient = existing_by_name.get(name)
+        if not patient:
+            patient = Patient(
+                name=name,
+                phone=f'98{idx:08d}',
+                email=f'patient{idx}@mail.com',
+            )
+            db.session.add(patient)
+            db.session.flush()
+            changed = True
+        patients.append(patient)
+
+    if changed:
+        db.session.commit()
+    return patients
+
+
+def _ensure_demo_appointments(doctors, patients):
+    if Appointment.query.count() > 0 or not doctors or not patients:
+        return
+
     import random
+
     statuses = ['booked', 'completed', 'completed', 'cancelled']
     now = datetime.utcnow()
 
